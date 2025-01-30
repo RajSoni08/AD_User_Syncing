@@ -11,6 +11,9 @@ using Microsoft.Graph.Models;
 using System.Security.Cryptography;
 using System.Text;
 using Serilog;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Kiota.Abstractions;
+using Microsoft.Kiota.Abstractions.Serialization;
 
 class Program
 {
@@ -20,30 +23,58 @@ class Program
         var clientId = "98dc6f71-84c5-49bb-a9c8-43e39f30406d";
         var clientSecret = "VCk8Q~3DGsbdFaisBbFlP4foQtmAESsiYFe-Mbew";
         var sqlConnectionString = "Server=cilantro-db-uat.database.windows.net;Database=Cilantro3_UAT;User ID=cgiadmin_db;Password= fXO94?8cQ-`{_B=M2C+uS`&];";
-        // 🔹 Azure Storage Connection String (Replace with your actual Azure Storage connection string)
-        string storageConnectionString = "DefaultEndpointsProtocol=https;AccountName=yourAccountName;AccountKey=yourAccountKey;EndpointSuffix=core.windows.net";
-        string containerName = "logs";
-        // Step 1: Authenticate and get access token from Azure AD
-        var graphClient = GetGraphServiceClient(tenantId, clientId, clientSecret);
 
-        // Step 2: Fetch all users from Azure AD
-        var azureADUsers = await GetAzureADUsers(graphClient);
+        IConfiguration configuration = new ConfigurationBuilder()
+            .SetBasePath(AppContext.BaseDirectory) // Set the base path
+            .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true) // Load config
+            .Build();
 
-        // Step 3: Fetch all users from SQL Database
-        var sqlUsers = GetSqlUsers(sqlConnectionString);
+        // Configure Serilog from appsettings.json
+        Log.Logger = new LoggerConfiguration()
+            .ReadFrom.Configuration(configuration) // Reads Serilog config
+            .CreateLogger();
 
-        // Step 4: Compare users and insert new users into SQL Database
-        foreach (var azureADUser in azureADUsers)
+        Log.Information(" AD User Syncing Application started at {Time}");
+        try
         {
-            string userMail = azureADUser.Mail;
-            string userName = azureADUser.DisplayName; // Extract Display Name
+            // Your application logic goes here
+            Log.Information("AD User Syncing Application started at {Time}", DateTime.UtcNow);
+            var graphClient = GetGraphServiceClient(tenantId, clientId, clientSecret);
 
-            // Check if the Mail exists in sqlUsers
-            if (!sqlUsers.Any(sqlUser => sqlUser.Mail.Equals(userMail, StringComparison.OrdinalIgnoreCase)))
+            // Step 2: Fetch all users from Azure AD
+            var azureADUsers = await GetAzureADUsers(graphClient);
+
+            // Step 3: Fetch all users from SQL Database
+            var sqlUsers = GetSqlUsers(sqlConnectionString);
+
+            // Step 4: Compare users and insert new users into SQL Database
+            foreach (var azureADUser in azureADUsers)
             {
-                InsertUserToSqlDatabase(sqlConnectionString, userMail, userName);
+                string userMail = azureADUser.Mail;
+                string userName = azureADUser.DisplayName; // Extract Display Name
+
+                // Check if the Mail exists in sqlUsers
+                if (!sqlUsers.Any(sqlUser => sqlUser.Mail.Equals(userMail, StringComparison.OrdinalIgnoreCase)))
+                {
+                    InsertUserToSqlDatabase(sqlConnectionString, userMail, userName);
+                }
             }
+            // Other application code...
         }
+        catch (Exception ex)
+        {
+            // Log any unhandled exceptions
+            Log.Error(ex, "An error occurred");
+        }
+        finally
+        {
+            // Ensure logs are flushed before the application exits
+            Log.CloseAndFlush();
+        }
+
+
+        // Step 1: Authenticate and get access token from Azure AD
+        
     }
 
     // 1. Authenticate and get GraphServiceClient
@@ -74,22 +105,26 @@ class Program
                 requestConfiguration.Headers.Add("ConsistencyLevel", "eventual");
             });
 
-            while (usersResponse != null)
+            while (usersResponse?.Value != null)
             {
-                if (usersResponse.Value != null)
-                {
-                    users.AddRange(usersResponse.Value
-                        .Where(user => !string.IsNullOrEmpty(user.Mail)) // Exclude users where Mail is null
-                        .Select(user => (user.Mail, user.DisplayName)));
-                    break;
-                }
+                // Add users from the current page
+                users.AddRange(usersResponse.Value
+                    .Where(user => !string.IsNullOrEmpty(user.Mail)) // Exclude users where Mail is null
+                    .Select(user => (user.Mail, user.DisplayName)));
 
-               
+                // Check if there is a next page
+                if (usersResponse.OdataNextLink == null)
+                    break; // No more pages, exit the loop
+
+                // Fetch the next page
+                usersResponse = await graphClient.Users
+                    .WithUrl(usersResponse.OdataNextLink) // This is the correct way to fetch the next page
+                    .GetAsync();
             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Error: {ex.Message}");
+            Log.Information($"Error: {ex.Message}");
         }
 
         return users;
@@ -133,14 +168,14 @@ class Program
                                 }
                                 catch (FormatException)
                                 {
-                                    Console.WriteLine("Invalid Hex encoding detected. Skipping entry.");
+                                    Log.Information("Invalid Hex encoding detected. Skipping entry.");
                                     continue;
                                 }
                             }
                         }
                         catch (Exception ex)
                         {
-                            Console.WriteLine($"Error: {ex.Message}");
+                            Log.Information($"Error: {ex.Message}");
                         }
 
                     }
@@ -149,7 +184,7 @@ class Program
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Database error: {ex.Message}");
+            Log.Information($"Database error: {ex.Message}");
         }
 
         return users;
@@ -158,6 +193,7 @@ class Program
     {
         try
         {
+            Log.Information("Inserting user {User} into the database...", userPrincipalName);
             // Encrypt the UserPrincipalName (email) before inserting
             string encryptedEmail = EmailEncryption.EncryptEmail(userPrincipalName);
 
@@ -167,13 +203,14 @@ class Program
 
                 // Adjust the query to insert both EncryptedEmail and DisplayName
                 string query = @"
-                INSERT INTO RBAC_All_UserMaster_AnjaniTempTesting (EmailId, UserName, IsActive, CreatedBy, CreatedDate) 
-                VALUES (@EmailId, @UserName, 1, 'AD Sync', GETUTCDATE())";
+                INSERT INTO RBAC_All_UserMaster_AnjaniTempTesting (EmailId, UserName, EmailIdDecrypted, IsActive, CreatedBy, CreatedDate) 
+                VALUES (@EmailId, @UserName, @EmailIdDecrypted ,1, 'AD Sync', GETUTCDATE())";
 
                 using (var command = new SqlCommand(query, connection))
                 {
                     // Add parameters
                     command.Parameters.AddWithValue("@EmailId", encryptedEmail);
+                    command.Parameters.AddWithValue("@EmailIdDecrypted", userPrincipalName);
                     command.Parameters.AddWithValue("@UserName", displayName); // Handle null names
 
                     // Execute the query
@@ -181,11 +218,11 @@ class Program
                 }
             }
 
-            Console.WriteLine($"User {userPrincipalName} inserted into SQL Database.");
+            Log.Information("User {User} inserted successfully.", userPrincipalName);
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Error inserting user: {ex.Message}");
+            Log.Error("Error inserting user {User}: {Message}", userPrincipalName, ex.Message);
         }
     }
 
