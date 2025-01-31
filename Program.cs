@@ -23,6 +23,7 @@ class Program
         var clientId = "98dc6f71-84c5-49bb-a9c8-43e39f30406d";
         var clientSecret = "VCk8Q~3DGsbdFaisBbFlP4foQtmAESsiYFe-Mbew";
         var sqlConnectionString = "Server=cilantro-db-uat.database.windows.net;Database=Cilantro3_UAT;User ID=cgiadmin_db;Password= fXO94?8cQ-`{_B=M2C+uS`&];";
+        string groupId = "b0942e91-e864-49b7-8540-27b797d03524";
 
         IConfiguration configuration = new ConfigurationBuilder()
             .SetBasePath(AppContext.BaseDirectory) // Set the base path
@@ -42,7 +43,7 @@ class Program
             var graphClient = GetGraphServiceClient(tenantId, clientId, clientSecret);
 
             // Step 2: Fetch all users from Azure AD
-            var azureADUsers = await GetAzureADUsers(graphClient);
+            var azureADUsers = await GetAzureADGroupUsers(graphClient, groupId);
 
             // Step 3: Fetch all users from SQL Database
             var sqlUsers = GetSqlUsers(sqlConnectionString);
@@ -90,47 +91,42 @@ class Program
     }
 
     // 2. Fetch all users from Azure AD
-    static async Task<List<(string Mail, string DisplayName)>> GetAzureADUsers(GraphServiceClient graphClient)
+    static async Task<List<(string Mail, string DisplayName)>> GetAzureADGroupUsers(GraphServiceClient graphClient, string groupId)
     {
         var users = new List<(string Mail, string DisplayName)>();
 
         try
         {
-            var usersResponse = await graphClient.Users.GetAsync(requestConfiguration =>
-            {
-                requestConfiguration.QueryParameters.Filter = $"createdDateTime ge {DateTime.UtcNow.AddDays(-1).ToString("o")}";
-                requestConfiguration.QueryParameters.Select = new[] { "mail", "displayName" };
-                requestConfiguration.QueryParameters.Top = 100; // Fetch 100 users per page
-                requestConfiguration.QueryParameters.Count = true;
-                requestConfiguration.Headers.Add("ConsistencyLevel", "eventual");
-            });
+            var membersResponse = await graphClient.Groups[groupId].Members.GraphUser
+                .GetAsync(requestConfiguration =>
+                {
+                    requestConfiguration.QueryParameters.Select = new[] { "mail", "displayName" };
+                    requestConfiguration.QueryParameters.Top = 100; // Fetch 100 users per page
+                });
 
-            while (usersResponse?.Value != null)
+            while (membersResponse?.Value != null)
             {
-                // Add users from the current page
-                users.AddRange(usersResponse.Value
+                users.AddRange(membersResponse.Value
                     .Where(user => !string.IsNullOrEmpty(user.Mail)) // Exclude users where Mail is null
                     .Select(user => (user.Mail, user.DisplayName)));
 
-                // Check if there is a next page
-                if (usersResponse.OdataNextLink == null)
+                if (membersResponse.OdataNextLink == null)
                     break; // No more pages, exit the loop
 
                 // Fetch the next page
-                usersResponse = await graphClient.Users
-                    .WithUrl(usersResponse.OdataNextLink) // This is the correct way to fetch the next page
+                membersResponse = await graphClient.Groups[groupId].Members
+                    .WithUrl(membersResponse.OdataNextLink)
+                    .GraphUser
                     .GetAsync();
             }
         }
         catch (Exception ex)
         {
-            Log.Information($"Error: {ex.Message}");
+            Log.Error($"Error fetching group users: {ex.Message}");
         }
 
         return users;
     }
-
-
     // 3. Fetch all users from SQL Database
 
     static List<(string Mail, string DisplayName)> GetSqlUsers(string connectionString)
